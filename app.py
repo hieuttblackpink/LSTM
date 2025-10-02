@@ -10,8 +10,10 @@ from nltk.corpus import stopwords, wordnet
 from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import word_tokenize
 import gensim
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-# Download required NLTK data
+# ==================== NLTK Downloads ====================
 nltk.download('stopwords', quiet=True)
 nltk.download('punkt', quiet=True)
 nltk.download('wordnet', quiet=True)
@@ -22,10 +24,20 @@ nltk.download('punkt_tab')
 
 app = Flask(__name__)
 
-# Load models and tokenizers
+# ==================== OLD MODEL (LSTM) ====================
 model = load_model('model.h5')
-tokenizer = pickle.load(open('tokenizer.pkl', 'rb'))
-encoder = pickle.load(open('encoder.pkl', 'rb'))
+#tokenizer = pickle.load(open('tokenizer.pkl', 'rb'))
+with open('tokenizer.pkl', 'rb') as f:
+    content = f.read().replace(b'\r', b'')
+
+tokenizer = pickle.loads(content)
+
+#encoder = pickle.load(open('encoder.pkl', 'rb'))
+with open('encoder.pkl', 'rb') as f:
+    content = f.read().replace(b'\r', b'')
+
+encoder = pickle.loads(content)
+
 w2v_model = gensim.models.Word2Vec.load('model.w2v')
 
 # Constants
@@ -35,7 +47,7 @@ NEGATIVE = "NEGATIVE"
 NEUTRAL = "NEUTRAL"
 SENTIMENT_THRESHOLDS = (0.4, 0.7)
 
-# Text preprocessing functions
+# ==================== TEXT PREPROCESSING ====================
 stop_words = set(stopwords.words("english"))
 stop_words.remove('not')
 more_stopwords = {'one', 'br', 'Po', 'th', 'sayi', 'fo', 'Unknown'}
@@ -115,6 +127,9 @@ def decode_sentiment(score, include_neutral=True):
         return NEGATIVE if score < 0.5 else POSITIVE
 
 def predict_sentiment(text):
+
+    print("Old model predicting...: ", text)
+
     # Preprocess text
     clean_text = preprocess_text(text)
     
@@ -133,6 +148,38 @@ def predict_sentiment(text):
         "confidence": max(score, 1-score) * 100
     }
 
+# ==================== TRANSFORMER (V2) ====================
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+transformer_name = "./best_model/distilbert-sentiment-model"
+trans_tokenizer = AutoTokenizer.from_pretrained(transformer_name)
+trans_model = AutoModelForSequenceClassification.from_pretrained(transformer_name).to(device)
+trans_model.eval()
+
+id2label = {1: NEGATIVE, 0: POSITIVE}
+
+def predict_transformer(texts, top_k=1):
+
+    print("V2 - Transformer model predicting...: ", texts)
+
+    enc = trans_tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors='pt').to(device)
+    with torch.no_grad():
+        out = trans_model(**enc)
+        logits = out.logits
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+
+    preds = np.argmax(probs, axis=-1)
+    results = []
+    for i, p in enumerate(preds):
+        score = probs[i][p]
+        results.append({
+            "label": id2label[p],
+            "score": float(score),
+            "confidence": float(score * 100)
+        })
+    return results
+
+# ==================== ROUTES ====================
+
 @app.route('/')
 def home():
     return render_template('index.html')
@@ -148,12 +195,29 @@ def predict():
         
         result = predict_sentiment(text)
         return jsonify(result)
-    
     except Exception as e:
         return jsonify({'error': str(e)})
 
+# --- NEW V2 ROUTES ---
+@app.route('/v2')
+def home_v2():
+    return render_template('index_v2.html')
+
+@app.route('/v2/predict', methods=['POST'])
+def predict_v2():
+    try:
+        data = request.get_json()
+        text = data['text']
+        if not text.strip():
+            return jsonify({'error': 'Please enter some text'})
+        result = predict_transformer([text])[0]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+# ==================== MAIN ====================
 if __name__ == '__main__':
     # app.run(debug=True)
     import os
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=True)
